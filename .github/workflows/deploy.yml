@@ -1,0 +1,93 @@
+name: Build and Deploy to Oracle Cloud VPS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  # Definimos el nombre de la imagen en minúsculas desde el inicio para evitar conflictos de mayúsculas
+  IMAGE_NAME: carlosangulo/fastapi-app 
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up QEMU to support building for ARM64 on AMD64 runners [Imprescindible para tu VPS ARM]
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Set up Docker Buildx for multi-platform builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Log in to GitHub Container Registry usando el token automático del runner
+      - name: Log in to the Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract metadata (tags, labels) for Docker
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=latest,enable=true
+
+      # Build and push Docker image para ambas arquitecturas (AMD64 y tu ARM64)
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          # Pasamos el PAT de lectura como variable de entorno segura a la sesión SSH
+          envs: REGISTRY, IMAGE_NAME
+          script: |
+            # 1. Autenticarse en GHCR DESDE la VPS usando el Personal Access Token guardado en tus Secrets
+            echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u carlosangulo --password-stdin
+            
+            # 2. Detener y remover el contenedor viejo si existe
+            docker stop fastapi-app || true
+            docker rm fastapi-app || true
+            
+            # 3. Descargar la versión fresca que acaba de compilar el pipeline
+            docker pull ghcr.io/carlosangulo/fastapi-app:latest
+            
+            # 4. Desplegar el nuevo contenedor en el puerto de FastAPI (8000)
+            docker run -d \
+              --name fastapi-app \
+              --restart always \
+              -p 8000:8000 \
+              ghcr.io/carlosangulo/fastapi-app:latest
+            
+            # 5. Mantenimiento: Limpieza de imágenes huérfanas/antiguas para no saturar tu disco de 200GB
+            docker image prune -f
